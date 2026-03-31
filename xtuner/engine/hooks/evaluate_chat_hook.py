@@ -139,10 +139,20 @@ class EvaluateChatHook(Hook):
  
                 print('#'*30)
                 print('evaluate wsi feat: ', image.shape)
-                image = model.LongNet_encoder(src_tokens=None, token_embeddings=image.to(model.llm.dtype).permute(1, 0, 2))["encoder_out"] # shape: (576, img_num, 1024)
-                image = image.permute(1, 0, 2) # shape: [1, 576, 512]
-
-                pixel_values = model.projector(image.to(model.llm.dtype))
+                cv_model = getattr(model, 'cv_model', None)
+                p_det = getattr(model, 'patch_detector', None)
+                if cv_model is not None:
+                    pixel_values = cv_model(image.to(model.llm.dtype))
+                else:
+                    feat = image.to(model.llm.dtype)
+                    if p_det is not None:
+                        feat, _, _ = p_det(feat)
+                    enc = model.LongNet_encoder(
+                        src_tokens=None,
+                        token_embeddings=feat.permute(1, 0, 2)
+                    )["encoder_out"]
+                    feat = enc.permute(1, 0, 2)
+                    pixel_values = model.projector(feat)
                 print('evaluate pixel_values: ', pixel_values.shape)
                 mm_inputs = prepare_inputs_labels_for_multimodal(
                     llm=model.llm,

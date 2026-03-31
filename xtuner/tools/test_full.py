@@ -537,12 +537,20 @@ def main():
 
         with torch.no_grad():
             img_embeds = image_tensor.to(llm.dtype)
-            img_enc_out = LongNet_encoder(
-                src_tokens=None, token_embeddings=img_embeds.permute(1, 0, 2)
-            )["encoder_out"]
-            
-            img_enc_out = img_enc_out.permute(1, 0, 2)
-            pixel_values = projector(img_enc_out)
+            cv_model = getattr(runner.model, 'cv_model', None)
+            patch_detector = getattr(runner.model, 'patch_detector', None)
+            if cv_model is not None:
+                pixel_values = cv_model(img_embeds)
+            else:
+                feat = img_embeds
+                if patch_detector is not None:
+                    feat, _, _ = patch_detector(feat)
+                img_enc_out = LongNet_encoder(
+                    src_tokens=None,
+                    token_embeddings=feat.permute(1, 0, 2)
+                )["encoder_out"]
+                img_enc_out = img_enc_out.permute(1, 0, 2)
+                pixel_values = projector(img_enc_out)
 
             mm_inputs = prepare_inputs_labels_for_multimodal(
                 llm=llm, input_ids=input_ids, pixel_values=pixel_values.half()

@@ -29,6 +29,14 @@ from .utils import (LoadWoInit, find_all_linear_names,
 from .torchscale.model.LongNet import make_longnet_from_name
 import torch.nn.functional as F
 
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+try:
+    from adapter_cv import CVModel, PatchDetector
+    CV_MODEL_AVAILABLE = True
+except ImportError:
+    CV_MODEL_AVAILABLE = False
+
 def convert_state_dict_to_hf(state_dict, mapping):
     new_state_dict = {}
     for key, value in state_dict.items():
@@ -62,7 +70,13 @@ class LLaVAModel(BaseModel):
                  max_position_embeddings=None,
                  hidden_size=512,
                  train_stage='2',
-                 enable_long_net=True):
+                 enable_long_net=True,
+                 enable_cv_model=False,
+                 cv_model_config=None,
+                 cv_model_pretrained=None,
+                 freeze_cv_model=False,
+                 detector_method=None,
+                 detector_config=None):
         super().__init__()
         
         self.enable_long_net = enable_long_net
@@ -94,6 +108,54 @@ class LLaVAModel(BaseModel):
         
         self.llm.config.use_cache = False
         dispatch_modules(self.llm)
+
+        self.enable_cv_model = enable_cv_model and CV_MODEL_AVAILABLE
+        self.cv_model = None
+        self.patch_detector = None
+
+        if self.enable_cv_model:
+            cv_cfg = cv_model_config or {}
+            det_cfg = detector_config or {}
+            self.cv_model = CVModel(
+                seg_backbone=cv_cfg.get('seg_backbone',
+                    cv_cfg.get('backbone_type', 'transformer')),
+                det_backbone=(detector_method
+                    or cv_cfg.get('det_backbone')),
+                fusion_mode=cv_cfg.get('fusion_mode', 'det_guided'),
+                cv_input_dim=cv_cfg.get('cv_input_dim', hidden_size),
+                cv_num_heads=cv_cfg.get('cv_num_heads', 8),
+                cv_num_layers=cv_cfg.get('cv_num_layers', 4),
+                cv_ff_dim=cv_cfg.get('cv_ff_dim', 2048),
+                cv_dropout=cv_cfg.get('cv_dropout', 0.1),
+                llm_hidden_size=self.llm.config.hidden_size,
+                proj_depth=cv_cfg.get('proj_depth', 2),
+                use_residual=cv_cfg.get('use_residual', True),
+                det_top_k=det_cfg.get('top_k'),
+                det_top_ratio=det_cfg.get('top_ratio', 0.7),
+                det_kwargs=det_cfg.get('kwargs', {}),
+            ).to(self.llm.dtype)
+            if cv_model_pretrained and os.path.isdir(cv_model_pretrained):
+                self.cv_model = CVModel.load(cv_model_pretrained)
+                self.cv_model = self.cv_model.to(self.llm.dtype)
+                print_log(
+                    f'Loaded pretrained cv_model from {cv_model_pretrained}',
+                    'current')
+            if freeze_cv_model:
+                self.cv_model.requires_grad_(False)
+                print('freeze_cv_model')
+            else:
+                det_name = detector_method or 'none'
+                print(f'cv_model enabled (detector={det_name})')
+        elif detector_method and CV_MODEL_AVAILABLE:
+            det_cfg = detector_config or {}
+            self.patch_detector = PatchDetector(
+                method=detector_method,
+                input_dim=hidden_size,
+                top_k=det_cfg.get('top_k'),
+                top_ratio=det_cfg.get('top_ratio', 0.7),
+                **det_cfg.get('kwargs', {}),
+            ).to(self.llm.dtype)
+            print(f'Standalone PatchDetector enabled: {detector_method}')
 
         self.projector_depth = projector_depth
 
@@ -223,6 +285,17 @@ class LLaVAModel(BaseModel):
         to_return.update(
             {k: v
              for k, v in state_dict.items() if 'LongNet_encoder.' in k})
+        # Step 5. CV Model
+        if self.enable_cv_model and self.cv_model is not None:
+            to_return.update(
+                {k: v
+                 for k, v in state_dict.items() if 'cv_model.' in k})
+        # Step 6. Standalone PatchDetector
+        if self.patch_detector is not None:
+            to_return.update(
+                {k: v
+                 for k, v in state_dict.items()
+                 if 'patch_detector.' in k})
         return to_return
 
     @staticmethod
@@ -329,14 +402,23 @@ class LLaVAModel(BaseModel):
         
         # data_dict['pixel_values']=[[pixel_values of img1], [pixel_values of img2], ...]
         if 'pixel_values' in data:
-            feat_to_proj = data['pixel_values'].to(self.llm.dtype) # torch.Size([1, img_num, 768])
-            if self.enable_long_net:
-                long_net_output = self.LongNet_encoder(src_tokens=None, token_embeddings=feat_to_proj.permute(1, 0, 2))["encoder_out"] # shape: (576, img_num, 1024)
-                feat_to_proj = long_net_output.permute(1, 0, 2) # shape: [1, img_num, 768]
+            feat_to_proj = data['pixel_values'].to(self.llm.dtype)
 
-            pixel_values = self.projector(feat_to_proj.to(self.llm.dtype))
+            if self.enable_cv_model and self.cv_model is not None:
+                pixel_values = self.cv_model(feat_to_proj)
+            else:
+                if self.patch_detector is not None:
+                    feat_to_proj, _, _ = self.patch_detector(feat_to_proj)
+                if self.enable_long_net:
+                    long_net_output = self.LongNet_encoder(
+                        src_tokens=None,
+                        token_embeddings=feat_to_proj.permute(1, 0, 2)
+                    )["encoder_out"]
+                    feat_to_proj = long_net_output.permute(1, 0, 2)
+                pixel_values = self.projector(
+                    feat_to_proj.to(self.llm.dtype))
 
-            data['pixel_values'] = pixel_values # shape: [1, 576, 4096]
+            data['pixel_values'] = pixel_values
             data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
 
         if mode == 'loss':
@@ -442,6 +524,22 @@ class LLaVAModel(BaseModel):
         print_log(f'Saving LongNet_encoder to {LongNet_encoder_path}', 'current')
         self.LongNet_encoder.save_pretrained(LongNet_encoder_path,
                                        **save_pretrained_kwargs)
+
+        # CV Model
+        if self.enable_cv_model and self.cv_model is not None:
+            cv_model_path = osp.join(save_dir, 'cv_model')
+            self.cv_model.save(cv_model_path)
+            print_log(f'Saving cv_model to {cv_model_path}', 'current')
+
+        # Standalone PatchDetector
+        if self.patch_detector is not None:
+            det_path = osp.join(save_dir, 'patch_detector')
+            os.makedirs(det_path, exist_ok=True)
+            torch.save(
+                self.patch_detector.state_dict(),
+                osp.join(det_path, 'model.pt'))
+            print_log(
+                f'Saving patch_detector to {det_path}', 'current')
 
     def to_huggingface_llava(self,
                              cfg,

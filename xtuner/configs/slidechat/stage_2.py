@@ -72,6 +72,12 @@ model = dict(
     freeze_llm=False,
     pretrained_pth=pretrained_pth,
     train_stage='2',
+    detector_method='abmil',
+    detector_config=dict(
+        top_ratio=0.7,
+        top_k=None,
+        kwargs=dict(hidden_dim=256, dropout=0.25, random_ratio=0.1),
+    ),
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
         pretrained_model_name_or_path=llm_name_or_path,

@@ -211,10 +211,18 @@ def main():
         input_ids = torch.tensor(input_ids).cuda()
 
 
-        image = runner.model.LongNet_encoder(src_tokens=None, token_embeddings=image.permute(1, 0, 2).to(runner.model.llm.dtype))["encoder_out"]
-        image = image.permute(1, 0, 2)
-
-        pixel_values = runner.model.projector(image)
+        if hasattr(runner.model, 'cv_model') and runner.model.cv_model is not None:
+            pixel_values = runner.model.cv_model(
+                image.to(runner.model.llm.dtype))
+        else:
+            feat = image.to(runner.model.llm.dtype)
+            if hasattr(runner.model, 'patch_detector') and runner.model.patch_detector is not None:
+                feat, _, _ = runner.model.patch_detector(feat)
+            enc_out = runner.model.LongNet_encoder(
+                src_tokens=None,
+                token_embeddings=feat.permute(1, 0, 2))["encoder_out"]
+            pixel_values = runner.model.projector(
+                enc_out.permute(1, 0, 2))
         mm_inputs = prepare_inputs_labels_for_multimodal(
             llm=runner.model.llm,
             input_ids=input_ids.unsqueeze(0),
